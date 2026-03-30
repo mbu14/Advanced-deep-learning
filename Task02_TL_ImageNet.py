@@ -76,17 +76,17 @@ def run_experiment(model, train_loader, test_loader, experiment_name, device):
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        test_loss,  test_acc  = evaluate(model, test_loader, criterion, device)
+        val_loss,  val_acc  = evaluate(model, test_loader, criterion, device)
 
         print(f"Epoch [{epoch:2d}/{EPOCHS}] | "
               f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | "
-              f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}% | "
+              f"Validation Loss: {val_loss:.4f}, Validation Acc: {val_acc:.2f}% | "
               f"Time: {time.time()-t0:.1f}s")
 
-    print(f"\n>>> Final Test Accuracy with {experiment_name}: {test_acc:.2f}%")
-    return test_acc
+    print(f"\n>>> Final Test Accuracy with {experiment_name}: {val_acc:.2f}%")
+    return val_acc
 
-
+'''
 if __name__ == "__main__":
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
@@ -136,4 +136,4 @@ if __name__ == "__main__":
   generalise to CIFAR-10 objects, so performance is typically
   lower. On the other hand, feature extraction trains far fewer parameters
   and converges much faster.
-""")
+""")'''
