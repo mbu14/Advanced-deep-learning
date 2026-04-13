@@ -1,8 +1,10 @@
 import torch
+from datasets import load_dataset
 import os
 import gc
 import copy
 import numpy as np
+from torch.cuda.amp import GradScaler, autocast
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
@@ -53,6 +55,27 @@ def preprocess_pandas(data, columns):
             "Sentence": " ".join(filtered_sent)
         }
     return df_
+def fast_preprocess(batch):
+    # Process text in bulk
+    texts = batch['text']
+    processed_texts = []
+    
+    stop_words = set(stopwords.words('english'))
+    
+    for text in texts:
+        t = text.lower()
+        # Remove emails, IPs, punctuation, and digits using regex efficiently
+        t = re.sub(r'[a-zA-Z0-9-_.]+@[a-zA-Z0-9-_.]+', '', t)
+        t = re.sub(r'((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$)){4}', '', t)
+        t = re.sub(r'[^\w\s]', '', t)
+        t = re.sub(r'\d', '', t)
+        
+        # Tokenize and remove stopwords
+        words = word_tokenize(t)
+        filtered = [w for w in words if w not in stop_words]
+        processed_texts.append(" ".join(filtered))
+        
+    return {"Sentence": processed_texts, "Class": batch['label']}
 
 class SentimentDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=128):
@@ -135,6 +158,8 @@ def evaluate(model, loader, device):
 
 #def train_transformer(model, train_loader, val_loader, optimizer, scheduler, device, epochs=10, earlystopping=3, save_path="best_transformer.pth"):
 def train_transformer(model, train_loader, val_loader, optimizer, device, epochs=10, earlystopping=3, save_path="best_transformer.pth"):
+    # Initialize scaler for Mixed Precision (FP16)
+    scaler = torch.amp.GradScaler() 
     best_val_loss = float('inf')
     early_stop_counter = 0
 
@@ -143,43 +168,48 @@ def train_transformer(model, train_loader, val_loader, optimizer, device, epochs
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
         
-        for batch in train_loader:
+        for batch in train_loader: # Ensure this is properly indented inside the epoch loop [cite: 11]
             optimizer.zero_grad()
+    
+            input_ids = batch['input_ids'].to(device) 
+            attention_mask = batch['attention_mask'].to(device) 
+            labels = batch['labels'].to(device) 
             
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+            # Use autocast for FP16 speedup on your 3090
+            with torch.amp.autocast(device_type='cuda'):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels) 
+                loss = outputs.loss
+                logits = outputs.logits
             
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            logits = outputs.logits
+            # Scaler replaces the old loss.backward() and optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
-            loss.backward()
-            optimizer.step()
+            # CRITICAL: Old loss.backward() and optimizer.step() removed here [cite: 13]
             
-            train_loss += loss.item() * labels.size(0)
-            train_correct += logits.argmax(dim=1).eq(labels).sum().item()
-            train_total += labels.size(0)
+            train_loss += loss.item() * labels.size(0) 
+            train_correct += logits.argmax(dim=1).eq(labels).sum().item() 
+            train_total += labels.size(0) 
 
-        #scheduler.step()
+        # Evaluation phase starts here
+        epoch_train_loss = train_loss / train_total 
+        epoch_train_acc = 100 * train_correct / train_total 
+        current_lr = optimizer.param_groups[0]['lr'] 
         
-        epoch_train_loss = train_loss / train_total
-        epoch_train_acc = 100 * train_correct / train_total
-        current_lr = optimizer.param_groups[0]['lr']
+        val_loss, val_acc = evaluate(model, val_loader, device) 
         
-        val_loss, val_acc = evaluate(model, val_loader, device)
-        
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {current_lr:.2e}")
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {current_lr:.2e}") [cite: 15, 16]
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             early_stop_counter = 0
-            torch.save(model.state_dict(), save_path)
+            torch.save(model.state_dict(), save_path) 
             print("  --> Validation loss decreased. Model saved.")
         else:
-            early_stop_counter += 1
-            print(f"  --> Early stopping counter: {early_stop_counter} out of {earlystopping}")
-            if early_stop_counter >= earlystopping:
+            early_stop_counter += 1 
+            print(f"  --> Early stopping counter: {early_stop_counter} out of {earlystopping}") 
+            if early_stop_counter >= earlystopping: 
                 print("Early stopping!")
                 break
                 
@@ -194,12 +224,12 @@ print("Loading and preprocessing data...")
 
 columns = ['index', 'Class', 'Sentence']
 # Load and preprocess both datasets separately
-data_small = pd.read_csv("amazon_cells_labelled.txt", delimiter='\t', header=None)
+data_small = pd.read_csv("../data/amazon_cells_labelled_large_25K.txt", delimiter='\t', header=None)
 data_small.columns = ['Sentence', 'Class']
 data_small['index'] = data_small.index
 data_small = preprocess_pandas(data_small, columns)
 
-data_large = pd.read_csv("amazon_cells_labelled_LARGE_25K.txt", delimiter='\t', header=None)
+data_large = pd.read_csv("../data/amazon_cells_labelled_LARGE_25K.txt", delimiter='\t', header=None)
 data_large.columns = ['Sentence', 'Class']
 data_large['index'] = data_large.index
 data_large = preprocess_pandas(data_large, columns)
@@ -224,14 +254,14 @@ model = train_transformer(
     device=device,
     epochs=10000,
     earlystopping=100,
-    save_path="stage1_transformer.pth"
+    save_path="../data/stage1_transformer.pth"
 )
 
 print("\n Step 2:Fine-tuning on large dataset")
 train_loader, val_loader, test_loader = get_dataloaders(data_large, tokenizer)
 
 # Load best stage 1 model and continue training with a lower LR
-model.load_state_dict(torch.load("stage1_transformer.pth", weights_only=True))
+model.load_state_dict(torch.load("../data/stage1_transformer.pth", weights_only=True))
 optimizer = optim.AdamW(model.parameters(), lr=1e-5,)
 #scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)
 # cosin_scheduler, max amount of epochs annealing, 
@@ -244,7 +274,7 @@ model = train_transformer(
     device=device,
     epochs=10000,
     earlystopping=100,
-    save_path="stage2_transformer.pth"
+    save_path="../data/stage2_transformer.pth"
 )
 
 # Final evaluation
