@@ -1,0 +1,253 @@
+import torch
+import os
+import gc
+import copy
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score, classification_report
+import nltk
+from nltk.corpus import stopwords
+from nltk import word_tokenize
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, TensorDataset, DataLoader
+from datasets import Dataset as HFDataset
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForSequenceClassification, 
+    TrainingArguments, 
+    Trainer, 
+    EarlyStoppingCallback
+)
+
+#TODO: Get the trainable parameters of the transformer.  
+
+nltk.download('punkt_tab')
+nltk.download('stopwords')
+
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    print(f"{torch.cuda.memory_allocated() / 1024**2:.2f} MB allocated")
+    print(f"{torch.cuda.memory_reserved() / 1024**2:.2f} MB reserved")
+    
+def preprocess_pandas(data, columns):
+    df_ = pd.DataFrame(columns=columns)
+    data['Sentence'] = data['Sentence'].str.lower()
+    data['Sentence'] = data['Sentence'].replace('[a-zA-Z0-9-_.]+@[a-zA-Z0-9-_.]+', '', regex=True)
+    data['Sentence'] = data['Sentence'].replace(r'((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$)){4}', '', regex=True)
+    data['Sentence'] = data['Sentence'].str.replace(r'[^\w\s]','', regex=True)
+    data['Sentence'] = data['Sentence'].replace(r'\d', '', regex=True)
+    
+    stop_words = set(stopwords.words('english'))
+    for index, row in data.iterrows():
+        word_tokens = word_tokenize(row['Sentence'])
+        filtered_sent = [w for w in word_tokens if not w in stop_words]
+        df_.loc[len(df_)] = {
+            "index": row['index'],
+            "Class": row['Class'],
+            "Sentence": " ".join(filtered_sent)
+        }
+    return df_
+
+class SentimentDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len=128):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, item):
+        text = str(self.texts[item])
+        label = self.labels[item]
+
+        encoding = self.tokenizer(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+def get_dataloaders(data, tokenizer, test_size=0.15, val_size=0.15, batch_size=16, random_state=0):
+    # First split off test set
+    train_texts, test_texts, train_labels, test_labels = train_test_split(
+        data['Sentence'].values.astype('U'),
+        data['Class'].values.astype('int32'),
+        test_size=test_size,
+        random_state=random_state,
+        shuffle=True
+    )
+
+    # Split remaining data into train and val
+    train_texts, val_texts, train_labels, val_labels = train_test_split(
+        train_texts,
+        train_labels,
+        test_size=val_size,
+        random_state=random_state,
+        shuffle=True
+    )
+
+    print(f"Train size: {len(train_texts)} | Val size: {len(val_texts)} | Test size: {len(test_texts)}")
+
+    train_dataset = SentimentDataset(train_texts, train_labels, tokenizer)
+    val_dataset   = SentimentDataset(val_texts, val_labels, tokenizer)
+    test_dataset  = SentimentDataset(test_texts, test_labels, tokenizer)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader, test_loader
+
+def evaluate(model, loader, device):
+    model.eval()
+    running_loss, correct, total = 0.0, 0, 0
+    
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            
+            running_loss += outputs.loss.item() * labels.size(0)
+            correct += outputs.logits.argmax(dim=1).eq(labels).sum().item()
+            total += labels.size(0)
+            
+    return running_loss / total, 100 * correct / total
+
+#def train_transformer(model, train_loader, val_loader, optimizer, scheduler, device, epochs=10, earlystopping=3, save_path="best_transformer.pth"):
+def train_transformer(model, train_loader, val_loader, optimizer, device, epochs=10, earlystopping=3, save_path="best_transformer.pth"):
+    best_val_loss = float('inf')
+    early_stop_counter = 0
+
+    print("Starting training...")
+    for epoch in range(epochs):
+        model.train()
+        train_loss, train_correct, train_total = 0.0, 0, 0
+        
+        for batch in train_loader:
+            optimizer.zero_grad()
+            
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            logits = outputs.logits
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * labels.size(0)
+            train_correct += logits.argmax(dim=1).eq(labels).sum().item()
+            train_total += labels.size(0)
+
+        #scheduler.step()
+        
+        epoch_train_loss = train_loss / train_total
+        epoch_train_acc = 100 * train_correct / train_total
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        val_loss, val_acc = evaluate(model, val_loader, device)
+        
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {current_lr:.2e}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            early_stop_counter = 0
+            torch.save(model.state_dict(), save_path)
+            print("  --> Validation loss decreased. Model saved.")
+        else:
+            early_stop_counter += 1
+            print(f"  --> Early stopping counter: {early_stop_counter} out of {earlystopping}")
+            if early_stop_counter >= earlystopping:
+                print("Early stopping!")
+                break
+                
+    return model
+
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+print("Loading and preprocessing data...")
+
+columns = ['index', 'Class', 'Sentence']
+# Load and preprocess both datasets separately
+data_small = pd.read_csv("amazon_cells_labelled.txt", delimiter='\t', header=None)
+data_small.columns = ['Sentence', 'Class']
+data_small['index'] = data_small.index
+data_small = preprocess_pandas(data_small, columns)
+
+data_large = pd.read_csv("amazon_cells_labelled_LARGE_25K.txt", delimiter='\t', header=None)
+data_large.columns = ['Sentence', 'Class']
+data_large['index'] = data_large.index
+data_large = preprocess_pandas(data_large, columns)
+
+model_name = 'distilbert-base-uncased'
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+print("\n Step 1: Training on small dataset")
+train_loader, val_loader, test_loader = get_dataloaders(data_small, tokenizer)
+
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+model = model.to(device)
+optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+#scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)
+
+model = train_transformer(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    optimizer=optimizer,
+    #scheduler=scheduler,
+    device=device,
+    epochs=10000,
+    earlystopping=100,
+    save_path="stage1_transformer.pth"
+)
+
+print("\n Step 2:Fine-tuning on large dataset")
+train_loader, val_loader, test_loader = get_dataloaders(data_large, tokenizer)
+
+# Load best stage 1 model and continue training with a lower LR
+model.load_state_dict(torch.load("stage1_transformer.pth", weights_only=True))
+optimizer = optim.AdamW(model.parameters(), lr=1e-5,)
+#scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)
+# cosin_scheduler, max amount of epochs annealing, 
+model = train_transformer(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    optimizer=optimizer,
+    #scheduler=scheduler,
+    device=device,
+    epochs=10000,
+    earlystopping=100,
+    save_path="stage2_transformer.pth"
+)
+
+# Final evaluation
+model.load_state_dict(torch.load("stage2_transformer.pth"))
+test_loss, test_acc = evaluate(model, test_loader, device)
+print(f"\nFinal Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
