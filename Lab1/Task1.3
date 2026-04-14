@@ -1,0 +1,25 @@
+Comparison between the simple ANN, LSTM/BILSTM and Transformers
+
+Compare the performance in link with the scenarios
+- ANN is a good and quick code for simple situations, it works well for short sentences and not too complex sentences as the architecture (usually one or two neuron layer) doesn't capture very complex relationships
+- LSTM/BILSTM is a bit more computational costly but it captures dependencies in the sentence for words that are further. Words are not only a a "bag of words" but the order is important. It works better on larger dataset with more complex sentences
+- Transfomers have a very good performance due to their attention mechanism where each word is linked to every other word in the sentence. It is way moreheavy for computational time but it works very well for long and complex dataset
+Both LSTM and Transformers work better for sentiment analysis with more than two categories as there analysis of the situation is more complex and can detect small variations of the situation
+
+Compare complexity, accuracy, and efficiency
+Complexity : ANN < LSTM < Transformer
+Accuracy : ANN < LSTM < Transformer
+
+Insights
+Data amount to train:
+- ANN works well on small dataset
+- LSTM : good results on larger datasets
+- Transformers : Very good results on big and complex datasets + it is pretrained so we only need to fine tune and it already works well on small dataset
+
+Embedding :
+- ANN model -> TF-IDF - sparse and context-independent representation
+- LSTM models -> use word embeddings -  capture semantic similarity
+- Transformers -> contextual embeddings , attention mechanism - the representation of a word depends on its context, leading to better performance.
+
+Architectural choices : ANN and LSTM may be easier to understand because a transformer that we fine tune is in a way a "black box".
+We don't really know what happens inside whereas ANN and LSTM are more visual and easy to understand for us
