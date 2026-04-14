@@ -1,6 +1,7 @@
 import os
 import re
 import gc
+import time
 import hashlib
 import multiprocessing as mp
 import pandas as pd
@@ -17,22 +18,10 @@ from nltk.corpus import stopwords
 from nltk import word_tokenize
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import wandb
+from tqdm import tqdm
 
-
-def preprocess_pandas(data, columns):
-    data = data.copy()
-    data['Sentence'] = data['Sentence'].str.lower()
-    data['Sentence'] = data['Sentence'].str.replace(r'[a-zA-Z0-9-_.]+@[a-zA-Z0-9-_.]+', '', regex=True)
-    data['Sentence'] = data['Sentence'].str.replace(r'((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$)){4}', '', regex=True)
-    data['Sentence'] = data['Sentence'].str.replace(r'[^\w\s]', '', regex=True)
-    data['Sentence'] = data['Sentence'].str.replace(r'\d', '', regex=True)
-
-    stop_words = set(stopwords.words('english'))
-    data['Sentence'] = data['Sentence'].apply(
-        lambda s: ' '.join(w for w in word_tokenize(s) if w not in stop_words)
-    )
-    return data[columns]
-
+global_start_time = time.time()
 
 _stop_words_cache: set | None = None
 
@@ -72,7 +61,7 @@ def fast_preprocess(filepath, columns, cache_dir="../data/cache", delimiter='\t'
 
     n_workers  = n_workers or min(4, mp.cpu_count())
     rows       = list(zip(data['index'], data['Class'], data['Sentence']))
-    chunk_size = 10000
+    chunk_size = 1000
     chunks     = [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
     with mp.Pool(processes=n_workers, initializer=_worker_init) as pool:
@@ -94,7 +83,8 @@ def load_and_preprocess_hf(dataset_name='mteb/amazon_polarity', split='train', c
     print(f"Loading {dataset_name} ({split}) ...")
     dataset = load_dataset(dataset_name, split=split)
 
-    cache_path = os.path.join(cache_dir, f"{dataset_name.replace('/', '_')}_{split}_{dataset._fingerprint}.parquet")
+    safe_split = split.replace(':', '_').replace('[', '').replace(']', '').replace('%', 'pct')
+    cache_path = os.path.join(cache_dir, f"{dataset_name.replace('/', '_')}_{safe_split}_{dataset._fingerprint}.parquet")
 
     if os.path.exists(cache_path):
         print(f"Cache hit — loading preprocessed data from {cache_path}")
@@ -122,25 +112,21 @@ def count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-class SentimentDataset(Dataset):
-    def __init__(self, texts, labels):
-        self.texts = texts
-        self.labels = labels
+class TransformerCollate:
+    def __init__(self, tokenizer, max_len=256):
+        self.tokenizer = tokenizer
+        self.max_len = max_len
 
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, item):
-        return str(self.texts[item]), self.labels[item]
-
-
-def get_collate_fn(tokenizer, max_len=256):
-    def collate_fn(batch):
-        texts, labels = zip(*batch)
-        encodings = tokenizer(
+    def __call__(self, batch):
+        if isinstance(batch[0], dict):
+            texts = [str(b['Sentence']) for b in batch]
+            labels = [b['Class'] for b in batch]
+        else:
+            texts, labels = zip(*batch)
+        encodings = self.tokenizer(
             list(texts),
             add_special_tokens=True,
-            max_length=max_len,
+            max_length=self.max_len,
             padding='max_length',
             truncation=True,
             return_attention_mask=True,
@@ -151,39 +137,39 @@ def get_collate_fn(tokenizer, max_len=256):
             'attention_mask': encodings['attention_mask'],
             'labels': torch.tensor(labels, dtype=torch.long),
         }
-    return collate_fn
 
 
-def get_dataloaders(data, tokenizer, test_size=0.15, val_size=0.15, batch_size=64, num_workers=4, random_state=0):
-    train_texts, test_texts, train_labels, test_labels = train_test_split(
-        data['Sentence'].tolist(),
-        data['Class'].tolist(),
+def get_dataloaders(data, tokenizer, test_size=0.15, val_size=0.15, batch_size=32, num_workers=0, random_state=0):
+    from datasets import Dataset as HFDataset
+
+    train_df, test_df = train_test_split(
+        data,
         test_size=test_size,
         random_state=random_state,
         shuffle=True,
     )
 
     val_fraction = val_size / (1.0 - test_size)
-    train_texts, val_texts, train_labels, val_labels = train_test_split(
-        train_texts,
-        train_labels,
+    train_df, val_df = train_test_split(
+        train_df,
         test_size=val_fraction,
         random_state=random_state,
         shuffle=True,
     )
 
-    print(f"Train size: {len(train_texts)} | Val size: {len(val_texts)} | Test size: {len(test_texts)}")
+    print(f"Train size: {len(train_df)} | Val size: {len(val_df)} | Test size: {len(test_df)}")
 
-    train_dataset = SentimentDataset(train_texts, train_labels)
-    val_dataset   = SentimentDataset(val_texts,   val_labels)
-    test_dataset  = SentimentDataset(test_texts,  test_labels)
+    train_dataset = HFDataset.from_pandas(train_df)
+    val_dataset   = HFDataset.from_pandas(val_df)
+    test_dataset  = HFDataset.from_pandas(test_df)
 
-    collate_fn = get_collate_fn(tokenizer)
+    collate_fn = TransformerCollate(tokenizer)
     pin_memory = torch.cuda.is_available()
+    persistent_workers = num_workers > 0
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=pin_memory, num_workers=num_workers)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin_memory, num_workers=num_workers)
-    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin_memory, num_workers=num_workers)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=pin_memory, num_workers=num_workers, persistent_workers=persistent_workers)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin_memory, num_workers=num_workers, persistent_workers=persistent_workers)
+    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, collate_fn=collate_fn, pin_memory=pin_memory, num_workers=num_workers, persistent_workers=persistent_workers)
 
     return train_loader, val_loader, test_loader
 
@@ -206,7 +192,7 @@ def evaluate(model, loader, device):
     return running_loss / total, 100 * correct / total
 
 
-def train_transformer(model, train_loader, val_loader, optimizer, device, epochs=10, earlystopping=3, save_path="best_transformer.pth"):
+def train_transformer(model, train_loader, val_loader, test_loader, optimizer, device, epochs=10, earlystopping=3, save_path="best_transformer.pth", scheduler=None):
     use_amp = device.type == 'cuda'
     scaler  = torch.amp.GradScaler('cuda') if use_amp else None
 
@@ -218,7 +204,8 @@ def train_transformer(model, train_loader, val_loader, optimizer, device, epochs
         model.train()
         train_loss, train_correct, train_total = 0.0, 0, 0
 
-        for batch in train_loader:
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        for batch in progress_bar:
             optimizer.zero_grad()
 
             input_ids      = batch['input_ids'].to(device)
@@ -236,20 +223,39 @@ def train_transformer(model, train_loader, val_loader, optimizer, device, epochs
                 outputs.loss.backward()
                 optimizer.step()
 
+            if scheduler is not None:
+                scheduler.step()
+
             train_loss    += outputs.loss.item() * labels.size(0)
             train_correct += outputs.logits.argmax(dim=1).eq(labels).sum().item()
             train_total   += labels.size(0)
+
+            elapsed_mins = (time.time() - global_start_time) / 60.0
+            progress_bar.set_postfix({"Elapsed (min)": f"{elapsed_mins:.1f}"})
 
         epoch_train_loss = train_loss / train_total
         epoch_train_acc  = 100 * train_correct / train_total
         current_lr       = optimizer.param_groups[0]['lr']
         val_loss, val_acc = evaluate(model, val_loader, device)
+        test_loss, test_acc = evaluate(model, test_loader, device)
 
         print(
             f"Epoch {epoch+1}/{epochs} | "
             f"Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.2f}% | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {current_lr:.2e}"
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | "
+            f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}% | LR: {current_lr:.2e}"
         )
+
+        wandb.log({
+            "Epoch": epoch + 1,
+            "Train Loss": epoch_train_loss,
+            "Train Acc": epoch_train_acc,
+            "Val Loss": val_loss,
+            "Val Acc": val_acc,
+            "Test Loss": test_loss,
+            "Test Acc": test_acc,
+            "LR": current_lr
+        })
 
         if val_loss < best_val_loss:
             best_val_loss      = val_loss
@@ -271,6 +277,9 @@ def train_transformer(model, train_loader, val_loader, optimizer, device, epochs
 if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+    wandb.init(project="amazon-sentiment", name="distilbert-finetuning")
+    wandb.define_metric("*", step_metric="Epoch")
+
     nltk.download('punkt_tab')
     nltk.download('stopwords')
 
@@ -289,13 +298,16 @@ if __name__ == '__main__':
     model_name = 'distilbert-base-uncased'
     tokenizer  = AutoTokenizer.from_pretrained(model_name)
 
-    # Stage 1: train on 25K Amazon dataset
-    print("\nStage 1: Training on 25K Amazon dataset")
+    # Step 1: train on 25K Amazon dataset
+    print("\nStep 1: Training on 25K Amazon dataset")
     data_25k = fast_preprocess("../data/amazon_cells_labelled_LARGE_25K.txt", columns)
     train_loader, val_loader, test_loader = get_dataloaders(data_25k, tokenizer)
 
     model     = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+    
+    epochs_stage1 = 1000
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs_stage1)
 
     print(f"Trainable parameters: {count_trainable_params(model):,}")
 
@@ -303,33 +315,42 @@ if __name__ == '__main__':
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        test_loader=test_loader,
         optimizer=optimizer,
         device=device,
-        epochs=10000,
-        earlystopping=2,
+        epochs=epochs_stage1,
+        earlystopping=100,
         save_path="../data/stage1_transformer.pth",
+        scheduler=scheduler,
     )
 
-    # Stage 2: fine-tune on Amazon Polarity (HuggingFace)
-    print("\nStage 2: Fine-tuning on mteb/amazon_polarity")
-    data_hf = load_and_preprocess_hf('mteb/amazon_polarity', split='train')
+    # Step 2: fine-tune on Amazon Polarity (HuggingFace)
+    print("\nStep 2: Fine-tuning on mteb/amazon_polarity")
+    data_hf = load_and_preprocess_hf('mteb/amazon_polarity', split='train[:5%]')
     train_loader, val_loader, test_loader = get_dataloaders(data_hf, tokenizer)
 
     model.load_state_dict(torch.load("../data/stage1_transformer.pth", weights_only=True))
     optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+    
+    epochs_stage2 = 1000
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs_stage2)
 
     model = train_transformer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        test_loader=test_loader,
         optimizer=optimizer,
         device=device,
-        epochs=10000,
+        epochs=epochs_stage2,
         earlystopping=100,
         save_path="../data/stage2_transformer.pth",
+        scheduler=scheduler,
     )
 
     # Final evaluation
     model.load_state_dict(torch.load("../data/stage2_transformer.pth", weights_only=True))
     test_loss, test_acc = evaluate(model, test_loader, device)
     print(f"\nFinal Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
+    wandb.log({"Final Test Loss": test_loss, "Final Test Acc": test_acc})
+    wandb.finish()

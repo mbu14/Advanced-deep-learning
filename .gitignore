@@ -1,4 +1,6 @@
 data/*
+wandb/*
+Lab1/wandb/*
 !data/README.md
 
 # Python
