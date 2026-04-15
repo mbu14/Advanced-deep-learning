@@ -34,13 +34,8 @@ def _worker_init():
 def _process_chunk(rows: list[tuple]) -> list[tuple]:
     results = []
     for idx, cls, sentence in rows:
-        t = str(sentence).lower()
-        t = re.sub(r'[a-zA-Z0-9-_.]+@[a-zA-Z0-9-_.]+', '', t)
-        t = re.sub(r'((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$)){4}', '', t)
-        t = re.sub(r'[^\w\s]', '', t)
-        t = re.sub(r'\d+', '', t)
-        words = word_tokenize(t)
-        results.append((idx, cls, ' '.join(w for w in words if w not in _stop_words_cache)))
+        # Pass the raw text directly to the tokenizer (as in RoBERTa notebook)
+        results.append((idx, cls, str(sentence)))
     return results
 
 
@@ -113,7 +108,7 @@ def count_trainable_params(model: nn.Module) -> int:
 
 
 class TransformerCollate:
-    def __init__(self, tokenizer, max_len=256):
+    def __init__(self, tokenizer, max_len=256*2):
         self.tokenizer = tokenizer
         self.max_len = max_len
 
@@ -139,7 +134,7 @@ class TransformerCollate:
         }
 
 
-def get_dataloaders(data, tokenizer, test_size=0.15, val_size=0.15, batch_size=32, num_workers=0, random_state=0):
+def get_dataloaders(data, tokenizer, test_size=0.15, val_size=0.15, batch_size=64, num_workers=0, random_state=0):
     from datasets import Dataset as HFDataset
 
     train_df, test_df = train_test_split(
@@ -272,12 +267,11 @@ def train_transformer(model, train_loader, val_loader, test_loader, optimizer, d
     return model
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    wandb.init(project="amazon-sentiment", name="distilbert-finetuning")
+    wandb.init(project="Lab1", name="Distil-Bert-Amazon-Polarity - scheduler: CosineAnnealingLR")
     wandb.define_metric("*", step_metric="Epoch")
 
     nltk.download('punkt_tab')
@@ -301,7 +295,7 @@ if __name__ == '__main__':
     # Step 1: train on 25K Amazon dataset
     print("\nStep 1: Training on 25K Amazon dataset")
     data_25k = fast_preprocess("../data/amazon_cells_labelled_LARGE_25K.txt", columns)
-    train_loader, val_loader, test_loader = get_dataloaders(data_25k, tokenizer)
+    train_loader, val_loader, test_loader = get_dataloaders(data_25k, tokenizer, batch_size=64)
 
     model     = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=2e-5)
@@ -310,7 +304,7 @@ if __name__ == '__main__':
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs_stage1)
 
     print(f"Trainable parameters: {count_trainable_params(model):,}")
-
+    torch.cuda.empty_cache()
     model = train_transformer(
         model=model,
         train_loader=train_loader,
@@ -319,22 +313,22 @@ if __name__ == '__main__':
         optimizer=optimizer,
         device=device,
         epochs=epochs_stage1,
-        earlystopping=100,
+        earlystopping=1,
         save_path="../data/stage1_transformer.pth",
         scheduler=scheduler,
     )
 
     # Step 2: fine-tune on Amazon Polarity (HuggingFace)
     print("\nStep 2: Fine-tuning on mteb/amazon_polarity")
-    data_hf = load_and_preprocess_hf('mteb/amazon_polarity', split='train[:5%]')
+    data_hf = load_and_preprocess_hf('mteb/amazon_polarity', split='train[:10%]')
     train_loader, val_loader, test_loader = get_dataloaders(data_hf, tokenizer)
 
     model.load_state_dict(torch.load("../data/stage1_transformer.pth", weights_only=True))
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-2)
     
-    epochs_stage2 = 1000
+    epochs_stage2 = 200
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs_stage2)
-
+    torch.cuda.empty_cache()
     model = train_transformer(
         model=model,
         train_loader=train_loader,
@@ -343,7 +337,7 @@ if __name__ == '__main__':
         optimizer=optimizer,
         device=device,
         epochs=epochs_stage2,
-        earlystopping=100,
+        earlystopping=50,
         save_path="../data/stage2_transformer.pth",
         scheduler=scheduler,
     )
