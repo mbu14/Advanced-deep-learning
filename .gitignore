@@ -7,3 +7,6 @@ Lab1/venv/*
 
 # Python
 __pycache__/
+Lab1/tea_debug.log
+Lab1/training_error.txt
+Lab1/training_log.txt

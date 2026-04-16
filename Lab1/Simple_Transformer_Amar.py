@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 from datasets import load_dataset, Dataset as HFDataset
 import wandb
 from tqdm import tqdm
@@ -165,7 +165,7 @@ def train(model, train_loader, val_loader, test_loader, optimizer, device,
 if __name__ == '__main__':
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    wandb.init(project="Lab1", name="DistilBERT-Amazon-Polarity-CosineAnnealingLR")
+    wandb.init(project="Lab1", name="DistilBERT-Amazon-Polarity-LinearWarmup")
     wandb.define_metric("*", step_metric="Epoch")
 
     gc.collect()
@@ -178,34 +178,48 @@ if __name__ == '__main__':
 
     print(f"Using device: {device}")
 
-    # ── Stage 1: local 25K dataset ──
-    print("\nStage 1: Training on 25K Amazon dataset")
-    df = load_local("../data/amazon_cells_labelled_LARGE_25K.txt")
-    train_loader, val_loader, test_loader = get_dataloaders(df, tokenizer, batch_size=8)
+    # # ── Stage 1: local 25K dataset ──
+    # print("\nStage 1: Training on 25K Amazon dataset")
+    # df = load_local("../data/amazon_cells_labelled_LARGE_25K.txt")
+    # train_loader, val_loader, test_loader = get_dataloaders(df, tokenizer, batch_size=8)
 
-    model     = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
-    epochs1   = 1000
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs1)
+    # model     = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
+    # optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+    # epochs1   = 100
+    # total_steps = len(train_loader) * epochs1
+    # warmup_steps = int(total_steps * 0.1)
+    # #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs1)
+    # scheduler = get_linear_schedule_with_warmup(
+    #     optimizer,
+    #     num_warmup_steps=warmup_steps,
+    #     num_training_steps=total_steps
+    # )
+    # print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
-    model = train(model, train_loader, val_loader, test_loader, optimizer, device,
-                  epochs=epochs1, early_stopping=1,
-                  save_path="../data/stage1.pth", scheduler=scheduler)
+    # model = train(model, train_loader, val_loader, test_loader, optimizer, device,
+    #               epochs=epochs1, early_stopping=5,
+    #               save_path="../data/stage1.pth", scheduler=scheduler)
 
     # ── Stage 2: HuggingFace Amazon Polarity (10%) ──
-    print("\nStage 2: Fine-tuning on mteb/amazon_polarity (10%)")
-    df2 = load_hf('mteb/amazon_polarity', split='train[:10%]')
-    train_loader, val_loader, test_loader = get_dataloaders(df2, tokenizer, batch_size=64)
+    print("\nFine-tuning on mteb/amazon_polarity (100%)")
+    df2 = load_hf('mteb/amazon_polarity', split='train[:100%]')
+    train_loader, val_loader, test_loader = get_dataloaders(df2, tokenizer, batch_size=128)
 
-    model.load_state_dict(torch.load("../data/stage1.pth", weights_only=True))
+    # model.load_state_dict(torch.load("../data/stage1.pth", weights_only=True))
+    model     = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-2)
-    epochs2   = 400
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs2)
-
+    epochs2   = 300
+    total_steps = len(train_loader) * epochs2
+    warmup_steps = int(total_steps * 0.1)
+    #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * epochs1)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
+    
     model = train(model, train_loader, val_loader, test_loader, optimizer, device,
-                  epochs=epochs2, early_stopping=100,
+                  epochs=epochs2, early_stopping=10,
                   save_path="../data/stage2.pth", scheduler=scheduler)
 
     # ── Final eval ──
