@@ -4,9 +4,12 @@ Lab1/wandb/*
 Lab1/.venv/*
 Lab1/venv/*
 !data/README.md
+best_model_lab3b.weights.h5
 
+*.zip
 # Python
 __pycache__/
 Lab1/tea_debug.log
 Lab1/training_error.txt
-Lab1/training_log.txt
+Lab1/training_log.txt*.weights.h5
+*.weights.h5
